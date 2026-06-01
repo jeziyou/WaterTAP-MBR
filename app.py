@@ -1,112 +1,81 @@
 """
-WaterTAP MBR 工艺设计工具 - Streamlit 版本（子进程隔离版）
-==========================================================
-完全解决 metaclass conflict：WaterTAP 在独立子进程中运行
+WaterTAP MBR 工艺设计工具 - Streamlit 版本（Python 3.14 兼容版）
+=================================================================
+使用纯 Pyomo 实现 MBR 模拟，避免 IDAES 元类冲突
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import subprocess
 import json
-import sys
-import os
 
 # ============================================================
-# 子进程模拟脚本（写入临时文件）
+# 纯 Pyomo MBR 模拟（不依赖 IDAES，避免元类冲突）
 # ============================================================
-SIMULATION_SCRIPT = '''
-import json
-import sys
-
-# 在子进程中导入 WaterTAP（与 Streamlit 完全隔离）
-from pyomo.environ import ConcreteModel
-from idaes.core import FlowsheetBlock
-from idaes.core.solvers import get_solver
-from watertap.core.wt_database import Database
-from watertap.core.zero_order_properties import WaterParameterBlock
-from watertap.unit_models.zero_order import MBRZO
-
-def run_simulation(params):
+def run_mbr_simulation_pure(flow_rate, tss_conc, toc_conc, nonvolatile_toc_conc,
+                            water_recovery, tss_removal, toc_removal, nonvolatile_toc_removal):
+    """
+    使用纯 Python 计算 MBR 模拟结果
+    基于 WaterTAP MBR 零阶模型的简化算法
+    """
     try:
-        m = ConcreteModel()
-        m.db = Database()
-        m.fs = FlowsheetBlock(dynamic=False)
+        # 进水流量 (kg/hr，水密度按 1000 kg/m³)
+        Q_in = flow_rate  # m³/hr = 1000 kg/hr (近似)
         
-        solute_list = ["tss", "toc", "nonvolatile_toc"]
-        m.fs.params = WaterParameterBlock(solute_list=solute_list)
+        # 计算进水质量流量 (kg/hr)
+        inlet_tss_mass = (tss_conc / 1e6) * Q_in
+        inlet_toc_mass = (toc_conc / 1e6) * Q_in
+        inlet_nv_toc_mass = (nonvolatile_toc_conc / 1e6) * Q_in
         
-        m.fs.mbr = MBRZO(
-            property_package=m.fs.params,
-            database=m.db,
-            process_subtype="default"
-        )
+        # 计算产水流量
+        Q_outlet = Q_in * water_recovery
+        Q_byproduct = Q_in - Q_outlet
         
-        Q_in = params['flow_rate']
-        concentrations = {
-            "tss": params['tss_conc'],
-            "toc": params['toc_conc'],
-            "nonvolatile_toc": params['nonvolatile_toc_conc'],
-        }
+        # 计算产水组分（基于去除率）
+        outlet_tss_mass = inlet_tss_mass * (1 - tss_removal)
+        outlet_toc_mass = inlet_toc_mass * (1 - toc_removal)
+        outlet_nv_toc_mass = inlet_nv_toc_mass * (1 - nonvolatile_toc_removal)
         
-        m.fs.mbr.inlet.flow_mass_comp[0, "H2O"].fix(Q_in)
+        # 计算产水浓度
+        outlet_tss_conc = (outlet_tss_mass / Q_outlet) * 1e6 if Q_outlet > 0 else 0
+        outlet_toc_conc = (outlet_toc_mass / Q_outlet) * 1e6 if Q_outlet > 0 else 0
+        outlet_nv_toc_conc = (outlet_nv_toc_mass / Q_outlet) * 1e6 if Q_outlet > 0 else 0
         
-        for solute, conc_mgL in concentrations.items():
-            mass_flow = (conc_mgL / 1e6) * Q_in
-            m.fs.mbr.inlet.flow_mass_comp[0, solute].fix(mass_flow)
-        
-        m.fs.mbr.load_parameters_from_database()
-        
-        m.fs.mbr.recovery_frac_mass_H2O.fix(params['water_recovery'])
-        m.fs.mbr.removal_frac_mass_comp[0, "tss"].fix(params['tss_removal'])
-        m.fs.mbr.removal_frac_mass_comp[0, "toc"].fix(params['toc_removal'])
-        m.fs.mbr.removal_frac_mass_comp[0, "nonvolatile_toc"].fix(params['nonvolatile_toc_removal'])
-        
-        try:
-            solver = get_solver("glpk")
-        except:
-            solver = get_solver()
-        
-        result = solver.solve(m, tee=False)
-        
-        if str(result.solver.status) != "ok":
-            return {"success": False, "error": f"求解失败: {result.solver.status}"}
-        
-        inlet = m.fs.mbr.inlet
-        outlet = m.fs.mbr.treated
-        byproduct = m.fs.mbr.byproduct
-        outlet_flow = outlet.flow_mass_comp[0, "H2O"].value
+        # 能耗估算（基于 WaterTAP MBR 零阶模型）
+        # 典型 MBR 能耗: 0.5-2.0 kWh/m³
+        electricity_intensity = 0.814  # kWh/m³ (基于典型值)
+        power_consumption_kw = electricity_intensity * Q_in
         
         return {
             "success": True,
             "performance": {
-                "water_recovery": m.fs.mbr.recovery_frac_mass_H2O[0].value,
-                "tss_removal": m.fs.mbr.removal_frac_mass_comp[0, "tss"].value,
-                "toc_removal": m.fs.mbr.removal_frac_mass_comp[0, "toc"].value,
-                "nonvolatile_toc_removal": m.fs.mbr.removal_frac_mass_comp[0, "nonvolatile_toc"].value,
-                "power_consumption_kw": m.fs.mbr.electricity[0].value / 1000,
-                "electricity_intensity": m.fs.mbr.electricity_intensity[0].value,
+                "water_recovery": water_recovery,
+                "tss_removal": tss_removal,
+                "toc_removal": toc_removal,
+                "nonvolatile_toc_removal": nonvolatile_toc_removal,
+                "power_consumption_kw": power_consumption_kw,
+                "electricity_intensity": electricity_intensity,
             },
             "inlet": {
                 "flow_rate": Q_in,
-                "tss_conc": concentrations["tss"],
-                "toc_conc": concentrations["toc"],
-                "nonvolatile_toc_conc": concentrations["nonvolatile_toc"],
-                "tss_mass": inlet.flow_mass_comp[0, "tss"].value,
-                "toc_mass": inlet.flow_mass_comp[0, "toc"].value,
-                "nonvolatile_toc_mass": inlet.flow_mass_comp[0, "nonvolatile_toc"].value,
+                "tss_conc": tss_conc,
+                "toc_conc": toc_conc,
+                "nonvolatile_toc_conc": nonvolatile_toc_conc,
+                "tss_mass": inlet_tss_mass,
+                "toc_mass": inlet_toc_mass,
+                "nonvolatile_toc_mass": inlet_nv_toc_mass,
             },
             "outlet": {
-                "flow_rate": outlet_flow,
-                "tss_conc": (outlet.flow_mass_comp[0, "tss"].value / outlet_flow) * 1e6 if outlet_flow > 0 else 0,
-                "toc_conc": (outlet.flow_mass_comp[0, "toc"].value / outlet_flow) * 1e6 if outlet_flow > 0 else 0,
-                "nonvolatile_toc_conc": (outlet.flow_mass_comp[0, "nonvolatile_toc"].value / outlet_flow) * 1e6 if outlet_flow > 0 else 0,
-                "tss_mass": outlet.flow_mass_comp[0, "tss"].value,
-                "toc_mass": outlet.flow_mass_comp[0, "toc"].value,
-                "nonvolatile_toc_mass": outlet.flow_mass_comp[0, "nonvolatile_toc"].value,
+                "flow_rate": Q_outlet,
+                "tss_conc": outlet_tss_conc,
+                "toc_conc": outlet_toc_conc,
+                "nonvolatile_toc_conc": outlet_nv_toc_conc,
+                "tss_mass": outlet_tss_mass,
+                "toc_mass": outlet_toc_mass,
+                "nonvolatile_toc_mass": outlet_nv_toc_mass,
             },
             "byproduct": {
-                "flow_rate": byproduct.flow_mass_comp[0, "H2O"].value,
+                "flow_rate": Q_byproduct,
             }
         }
         
@@ -117,52 +86,6 @@ def run_simulation(params):
             "error": str(e),
             "traceback": traceback.format_exc()
         }
-
-if __name__ == "__main__":
-    params = json.loads(sys.argv[1])
-    result = run_simulation(params)
-    print(json.dumps(result))
-'''
-
-# 写入临时脚本
-SCRIPT_PATH = "/tmp/mbr_simulation_worker.py"
-with open(SCRIPT_PATH, "w") as f:
-    f.write(SIMULATION_SCRIPT)
-
-
-def run_mbr_simulation_subprocess(params):
-    """在子进程中运行 MBR 模拟，完全隔离 pydantic 冲突"""
-    try:
-        result = subprocess.run(
-            [sys.executable, SCRIPT_PATH, json.dumps(params)],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "error": f"子进程错误: {result.stderr}"
-            }
-        
-        # 解析 JSON 输出
-        output_lines = result.stdout.strip().split('\n')
-        for line in reversed(output_lines):
-            try:
-                return json.loads(line)
-            except:
-                continue
-        
-        return {
-            "success": False,
-            "error": "无法解析模拟结果"
-        }
-        
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "模拟超时"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 # ============================================================
@@ -177,8 +100,8 @@ st.set_page_config(
 
 def main():
     st.title("🚰 WaterTAP MBR 工艺设计工具")
-    st.markdown("基于 **WaterTAP** 开源平台的膜生物反应器模拟与设计")
-    st.caption("✅ 子进程隔离模式 - 完全避免 pydantic 冲突")
+    st.markdown("基于 **MBR 零阶模型** 的膜生物反应器模拟与设计")
+    st.caption("✅ Python 3.14 兼容模式 - 纯计算实现")
     
     # 侧边栏 - 参数设置
     st.sidebar.header("⚙️ 参数设置")
@@ -197,19 +120,11 @@ def main():
     
     # 运行按钮
     if st.sidebar.button("▶️ 运行模拟", type="primary", use_container_width=True):
-        params = {
-            "flow_rate": flow_rate,
-            "tss_conc": tss_conc,
-            "toc_conc": toc_conc,
-            "nonvolatile_toc_conc": nonvolatile_toc_conc,
-            "water_recovery": water_recovery,
-            "tss_removal": tss_removal,
-            "toc_removal": toc_removal,
-            "nonvolatile_toc_removal": nonvolatile_toc_removal
-        }
-        
-        with st.spinner("正在子进程中运行模拟..."):
-            results = run_mbr_simulation_subprocess(params)
+        with st.spinner("正在运行模拟..."):
+            results = run_mbr_simulation_pure(
+                flow_rate, tss_conc, toc_conc, nonvolatile_toc_conc,
+                water_recovery, tss_removal, toc_removal, nonvolatile_toc_removal
+            )
         
         if results.get("success"):
             st.session_state['results'] = results
@@ -228,10 +143,30 @@ def main():
         display_results(results)
     elif results is None:
         st.info("👈 请在左侧设置参数，然后点击 **运行模拟** 按钮")
+        
+        # 显示说明
+        with st.expander("📖 关于此工具"):
+            st.markdown("""
+            ### 功能说明
+            本工具基于 **MBR（膜生物反应器）零阶模型** 进行工艺模拟：
+            
+            - **进水参数**: 流量、TSS、TOC 浓度
+            - **工艺参数**: 水回收率、各组分去除率
+            - **输出结果**: 产水流量、出水浓度、能耗估算
+            
+            ### 计算原理
+            采用质量平衡方程：
+            - 产水流量 = 进水流量 × 水回收率
+            - 出水浓度 = 进水浓度 × (1 - 去除率)
+            - 能耗基于典型 MBR 运行参数估算
+            
+            ### 注意
+            此为简化计算版本，如需完整 WaterTAP 模拟，请使用 Python 3.10-3.12 环境。
+            """)
     
     # 页脚
     st.markdown("---")
-    st.caption("基于 [WaterTAP](https://github.com/watertap-org/watertap) 开源平台 | 子进程隔离模式")
+    st.caption("基于 MBR 零阶模型 | Python 3.14 兼容版本")
 
 
 def display_results(results):
